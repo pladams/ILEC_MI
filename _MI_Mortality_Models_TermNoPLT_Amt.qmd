@@ -1,0 +1,1804 @@
+## Excluding PLT
+
+```{r}
+#| output: false
+
+dat.term.noplt <- readRDS("dat.term.noplt.rds")
+dat.term.noplt <- dat.term.noplt[Policies_Exposed > 0]
+
+# Force usage of all interactions
+# This was a setting used in early experiments.
+bUseAllInteractions <- FALSE
+
+# Set up the age and durational breaks to group those columns
+AA.brks <- c(-1,17,
+             seq(25,115,5))
+AA.lbls <- paste0(
+  AA.brks[1:(length(AA.brks)-1)]+1,
+  "-",
+  AA.brks[2:length(AA.brks)]
+)
+
+Dur.brks <- c(0,1,2,3,5,10,15,20,30,100)
+Dur.lbls <- paste0(
+  Dur.brks[1:(length(Dur.brks)-1)]+1,
+  "-",
+  Dur.brks[2:length(Dur.brks)]
+)
+
+dat.term.noplt[,`:=`(
+  AA_Grp=cut(Attained_Age,
+              breaks=AA.brks,
+              labels=AA.lbls),
+  Dur_Grp=cut(Duration,
+               breaks=Dur.brks,
+               labels=Dur.lbls)
+)]
+
+
+# Aside the names of the columns we want to use for the model
+pred.cols <- names(dat.term.noplt)[c(1,5:6,15:17)]
+
+# Declare the factor columns and ensure that those columns of
+# the data.table are classed accordingly
+factor.cols <- c("Sex",
+                 "Face_Amount_Band",
+                 "SOA_Post_Lvl_Ind",
+                 "UW",
+                 "AA_Grp",
+                 "Dur_Grp")
+
+dat.term.noplt[,
+      (factor.cols):=lapply(.SD,factor),
+      .SDcols=factor.cols]
+
+# The UW variable sorts alphabetically when it is created.
+# We want the sort to follow a lexicographic convention of
+# smoker status, number of risk classes, and risk class
+UW.levels<-data.table(UW.levels=dat.term.noplt[,levels(UW)])
+UW.levels[,c("NS","Pref_Class","NClasses"):=tstrsplit(UW.levels,"/")]
+setkeyv(UW.levels,c("NS","NClasses","Pref_Class"))
+
+# Mark rows for the train test split for boosting,
+# create a Noise column, and rewrite the
+# face amount band labels to the more compact version.
+set.seed(traintest.seed)
+dat.term.noplt %>%
+  mutate(
+    IsTraining = (runif(nrow(.)) < training.fraction),
+    Noise = rnorm(nrow(.)),
+    .before = 1
+  ) %>% 
+  mutate(Face_Amount_Band=fct_relabel(
+    Face_Amount_Band,
+    #function(.) sub(":"," -",.,fixed=T)
+    function(.) fa.remap[Face_Amount_Band.Old==.,Face_Amount_Band.New]
+    ),
+    AE_Count=Death_Count/ExpDth_Cnt_VBT2015,
+    AE_Amount=Death_Claim_Amount/ExpDth_Amt_VBT2015,
+    UW=factor(UW,levels=UW.levels$UW.levels)
+  ) -> 
+  dat.term.noplt
+
+# Set aside the names of the variables for boosting
+gbm.pred.cols <- c("Noise",pred.cols)
+```
+
+Here is a data preview.
+
+```{r}
+dat.term.noplt %>%
+  head(10) %>%
+  flextable()
+
+```
+
+### Feature Discovery with Catboost
+
+As in the predictive analytics framework, gradient boosted machines as implemented with Catboost are used for exploratory data analysis. The framework uses LightGBM, while Catboost is used here. This was done to take advantage of GPUs.
+
+```{r}
+
+
+### Create two pools for training and testing data.
+### Note that due to a seeming bug in catboost, we
+### convert the binary category of Sex to numeric.
+
+### Then fit a catboost model
+dat.term.noplt %>% 
+  filter(IsTraining == TRUE) %>% 
+  select(all_of(gbm.pred.cols)) %>% 
+  mutate(Sex = as.numeric(Sex)) %>%
+  catboost.load_pool(
+    data=.,
+    label = dat.term.noplt[IsTraining==TRUE,AE_Amount],
+    weight = dat.term.noplt[IsTraining==TRUE,ExpDth_Amt_VBT2015]) ->
+  train_pool_notplt
+
+dat.term.noplt %>% 
+  filter(IsTraining == FALSE) %>% 
+  select(all_of(gbm.pred.cols)) %>% 
+  mutate(Sex = as.numeric(Sex)) %>%
+  catboost.load_pool(
+    data=.,
+    label = dat.term.noplt[IsTraining==FALSE,AE_Amount],
+    weight = dat.term.noplt[IsTraining==FALSE,ExpDth_Amt_VBT2015]) ->
+  test_pool_notplt
+
+if(bUseCache & file.exists(
+  'dat.term.mod.notplt.cbm'
+) & !bInvalidateCaches)
+{
+  cb.model.notplt <- catboost.load_model(model_path = 'dat.term.mod.notplt.cbm')
+} else {
+  cb.model.notplt <- catboost.train(learn_pool=train_pool_notplt,
+                             test_pool = test_pool_notplt,
+                             params=fit_params)
+  
+  catboost.save_model(cb.model.notplt,
+                      model_path = 'dat.term.mod.notplt.cbm')
+}
+
+
+```
+
+### Feature Importance
+
+Next is to check for the variables with most variability. Face amount band and underwriting top the list, with importance declining for the others. Note that "importance" is a measure of relative variability and not "significance".
+
+```{r}
+### Extract the shap values. This implicitly relies on a custom function.
+shp.notplt <- shapviz(
+  cb.model.notplt,
+  X=as.data.frame(dat.term.noplt[IsTraining==TRUE,..gbm.pred.cols] %>% mutate(Noise=runif(nrow(.)),.before = 1)),
+  X_pred=train_pool_notplt
+)
+
+setDT(shp.notplt$X)
+shp.notplt$X[,c("NS","Pref_Class","NClasses"):=tstrsplit(UW,"/")]
+
+sv_importance(shp.notplt) + theme_minimal()
+
+```
+
+### Feature Interactions
+
+The top three interactions are face amount band with each of underwriting, duration, and attained age. We look at only those here. For the sake of thoroughness, the top eight are used for the elastic net.
+
+```{r}
+### Extract feature interactions, which are unfortunately indexed by column.
+### Thus, they need to be returned to their proper names.
+
+imp.int.notplt <- catboost.get_feature_importance(
+  cb.model.notplt,
+  train_pool_notplt,
+  type="Interaction"
+)
+mod.ft.map.notplt <- data.table(
+  FeatureNames=names(dat.term.noplt[IsTraining==TRUE,..gbm.pred.cols])
+)
+
+mod.ft.map.notplt[,ID:=1:nrow(.SD)-1]
+
+imp.int.notplt %>%
+  merge(mod.ft.map.notplt,
+        by.x="feature1_index",
+        by.y="ID") %>%
+  merge(mod.ft.map.notplt,
+        by.x="feature2_index",
+        by.y="ID") %>%
+  setnames(
+    old=c("FeatureNames.x","FeatureNames.y"),
+    new=c("Feature1","Feature2")
+  ) %>% 
+  mutate(feature1_index=NULL,feature2_index=NULL) %>%
+  as.data.table() %>%
+  setcolorder(c("Feature1","Feature2","score")) -> 
+  imp.int.notplt
+
+imp.int.notplt[order(-score)] %>%
+  filter(Feature1 != "Noise") %>%
+  flextable() %>%
+  colformat_double(j="score",digits = 2)
+
+
+```
+
+### Feature Interaction Plots
+
+Each of the interactions are discussed below with plots using SHAP values from both sides of the interaction. Focus is on the top three.
+
+#### UW
+
+##### Face Amount Band SHAPs
+
+While the SHAP values for face amount tend to be stable across preferred classes within a given class system, two phenomena stand out:
+
+1. The SHAP value distribution is shifted rightward for face amounts 25K - <100K.
+2. The SHAP value distribution for those face amounts exhibits greater spread and also multiple modes, suggesting the presence of multiple distinct cohorts.
+
+::: panel-tabset
+###### Smoker Class: Non-smoker, Preferred Classes: Unknown
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(Face_Amount_Band,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"Face_Amount_Band"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'NS' & NClasses == 'U') %>%
+  ggplot(aes(y=Face_Amount_Band, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect Face_Amount_Band"),
+          subtitle = paste0("for non-smokers, unknown preferred classes")) +
+  theme_minimal()
+
+```
+
+###### Smoker Class: Non-smoker, Preferred Classes: 2
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(Face_Amount_Band,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"Face_Amount_Band"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'NS' & NClasses == '2') %>%
+  ggplot(aes(y=Face_Amount_Band, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect Face_Amount_Band"),
+          subtitle = paste0("for non-smokers, 2 preferred classes")) +
+  theme_minimal()
+
+```
+
+###### Smoker Class: Non-smoker, Preferred Classes: 3
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(Face_Amount_Band,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"Face_Amount_Band"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'NS' & NClasses == '3') %>%
+  ggplot(aes(y=Face_Amount_Band, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect Face_Amount_Band"),
+          subtitle = paste0("for non-smokers, 3 preferred classes")) +
+  theme_minimal()
+
+```
+
+###### Smoker Class: Non-smoker, Preferred Classes: 4
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(Face_Amount_Band,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"Face_Amount_Band"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'NS' & NClasses == '4') %>%
+  ggplot(aes(y=Face_Amount_Band, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect Face_Amount_Band"),
+          subtitle = paste0("for non-smokers, 4 preferred classes")) +
+  theme_minimal()
+
+```
+
+###### Smoker Class: Smoker, Preferred Classes: Unknown
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(Face_Amount_Band,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"Face_Amount_Band"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'S' & NClasses == 'U') %>%
+  ggplot(aes(y=Face_Amount_Band, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect Face_Amount_Band"),
+          subtitle = paste0("for smokers, unknown preferred classes")) +
+  theme_minimal()
+
+```
+
+###### Smoker Class: Smoker, Preferred Classes: 2
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(Face_Amount_Band,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"Face_Amount_Band"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'S' & NClasses == '2') %>%
+  ggplot(aes(y=Face_Amount_Band, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect Face_Amount_Band"),
+          subtitle = paste0("for smokers, 2 preferred classes")) +
+  theme_minimal()
+
+```
+
+###### Smoker Class: Unismokers
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(Face_Amount_Band,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"Face_Amount_Band"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'U') %>%
+  ggplot(aes(y=Face_Amount_Band, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect Face_Amount_Band"),
+          subtitle = paste0("for unismokers")) +
+  theme_minimal()
+
+```
+:::
+
+##### UW SHAPs
+
+There is much to unpack from the UW SHAP values stratified by face amount band.
+
+1. For 2-, 3-, and 4-class systems, there is a persistent pattern of bimodality in the SHAP values. 
+  i) For 2-class non-smoker systems, the residual standard class exhibits bimodality and a distinct arc of shifting distributions for lower face amounts.
+  ii) For 3-class non-smoker systems, the bimodality is present across all three levels.
+  iii) For 4-class non-smoker systems, the bimodality is evident for the best two preferred classes at face amounts above 100K.
+  iv) Bimodality is evident in the smoker 2-class as well.
+2. Somewhat less obvious is the gradual shifting to the left or right with changes in face amount band across the plots.
+
+::: panel-tabset
+###### Smoker Class: Non-smoker, Preferred Classes: Unknown
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(Face_Amount_Band,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"UW"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'NS' & NClasses == 'U') %>%
+  ggplot(aes(y=Face_Amount_Band, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect UW"),
+          subtitle = paste0("for non-smokers, unknown preferred classes")) +
+  theme_minimal()
+
+```
+
+###### Smoker Class: Non-smoker, Preferred Classes: 2
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(Face_Amount_Band,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"UW"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'NS' & NClasses == '2') %>%
+  ggplot(aes(y=Face_Amount_Band, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect UW"),
+          subtitle = paste0("for non-smokers, 2 preferred classes")) +
+  theme_minimal()
+
+```
+
+###### Smoker Class: Non-smoker, Preferred Classes: 3
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(Face_Amount_Band,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"UW"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'NS' & NClasses == '3') %>%
+  ggplot(aes(y=Face_Amount_Band, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect UW"),
+          subtitle = paste0("for non-smokers, 3 preferred classes")) +
+  theme_minimal()
+
+```
+
+###### Smoker Class: Non-smoker, Preferred Classes: 4
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(Face_Amount_Band,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"UW"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'NS' & NClasses == '4') %>%
+  ggplot(aes(y=Face_Amount_Band, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect UW"),
+          subtitle = paste0("for non-smokers, 4 preferred classes")) +
+  theme_minimal()
+
+```
+
+###### Smoker Class: Smoker, Preferred Classes: Unknown
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(Face_Amount_Band,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"UW"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'S' & NClasses == 'U') %>%
+  ggplot(aes(y=Face_Amount_Band, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect UW"),
+          subtitle = paste0("for smokers, unknown preferred classes")) +
+  theme_minimal()
+
+```
+
+###### Smoker Class: Smoker, Preferred Classes: 2
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(Face_Amount_Band,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"UW"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'S' & NClasses == '2') %>%
+  ggplot(aes(y=Face_Amount_Band, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect UW"),
+          subtitle = paste0("for smokers, 2 preferred classes")) +
+  theme_minimal()
+
+```
+
+###### Smoker Class: Unismokers
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(Face_Amount_Band,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"UW"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'U') %>%
+  ggplot(aes(y=Face_Amount_Band, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect UW"),
+          subtitle = paste0("for unismokers")) +
+  theme_minimal()
+
+```
+:::
+
+#### Duration Group
+
+Among face amount SHAPs, there is not a clear interaction by duration. However, an interaction is apparent in the duration SHAPs. Note the gradual shifting rightward for durations 21-30 and leftward for durations 31+ in the right-most panel of the second plot.
+
+##### Face Amount Band SHAPs
+
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(Face_Amount_Band,
+                    Dur_Grp)],
+    shap=shp.notplt$S[,"Face_Amount_Band"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(Dur_Grp2=fct_collapse(
+    Dur_Grp,
+    ' 1- 5' = c('1-1','2-2','3-3','4-5'),
+    ' 6-20' = c('6-10','11-15','16-20'),
+    other_level = '21+'
+  )) %>%
+  ggplot(aes(y=Face_Amount_Band, x=exp(shap),color=Dur_Grp,fill=Dur_Grp)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)",
+                     limits = c(NA,1.5)) +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect Face_Amount_Band"),
+          subtitle = "by duration group") +
+  theme_minimal() + facet_wrap(vars(Dur_Grp2))
+```
+
+##### Duration Group SHAPs
+
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(Face_Amount_Band,
+                    Dur_Grp)],
+    shap=shp.notplt$S[,"Dur_Grp"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(Dur_Grp2=fct_collapse(
+    Dur_Grp,
+    ' 1- 5' = c('1-1','2-2','3-3','4-5'),
+    ' 6-20' = c('6-10','11-15','16-20'),
+    other_level = '21+'
+  )) %>%
+  ggplot(aes(y=Face_Amount_Band, x=exp(shap),color=Dur_Grp,fill=Dur_Grp)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)",
+                     limits = c(NA,1.25)) +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect Dur_Grp"),
+          subtitle = "by duration group") +
+  theme_minimal() + facet_wrap(vars(Dur_Grp2))
+```
+
+#### SOA PLT Indicator vs UW
+
+There are some differences in the spread of preferred factors across the PLT types, specifically for the NLT subgroup.
+
+##### UW SHAPs
+
+::: panel-tabset
+###### Smoker Class: Non-smoker, Preferred Classes: Unknown
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(SOA_Post_Lvl_Ind,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"UW"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'NS' & NClasses == 'U') %>%
+  ggplot(aes(y=SOA_Post_Lvl_Ind, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect UW"),
+          subtitle = paste0("for non-smokers, unknown preferred classes")) +
+  theme_minimal()
+
+
+```
+
+###### Smoker Class: Non-smoker, Preferred Classes: 2
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(SOA_Post_Lvl_Ind,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"UW"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'NS' & NClasses == '2') %>%
+  ggplot(aes(y=SOA_Post_Lvl_Ind, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect UW"),
+          subtitle = paste0("for non-smokers, 2 preferred classes")) +
+  theme_minimal()
+
+
+```
+
+###### Smoker Class: Non-smoker, Preferred Classes: 3
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(SOA_Post_Lvl_Ind,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"UW"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'NS' & NClasses == '3') %>%
+  ggplot(aes(y=SOA_Post_Lvl_Ind, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect UW"),
+          subtitle = paste0("for non-smokers, 3 preferred classes")) +
+  theme_minimal()
+
+```
+
+###### Smoker Class: Non-smoker, Preferred Classes: 4
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(SOA_Post_Lvl_Ind,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"UW"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'NS' & NClasses == '4') %>%
+  ggplot(aes(y=SOA_Post_Lvl_Ind, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect UW"),
+          subtitle = paste0("for non-smokers, 4 preferred classes")) +
+  theme_minimal()
+
+```
+
+###### Smoker Class: Smoker, Preferred Classes: Unknown
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(SOA_Post_Lvl_Ind,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"UW"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'S' & NClasses == 'U') %>%
+  ggplot(aes(y=SOA_Post_Lvl_Ind, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect UW"),
+          subtitle = paste0("for smokers, unknown preferred classes")) +
+  theme_minimal()
+
+```
+
+###### Smoker Class: Smoker, Preferred Classes: 2
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(SOA_Post_Lvl_Ind,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"UW"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'S' & NClasses == '2') %>%
+  ggplot(aes(y=SOA_Post_Lvl_Ind, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect UW"),
+          subtitle = paste0("for smokers, 2 preferred classes")) +
+  theme_minimal()
+
+```
+
+###### Smoker Class: Unismokers
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(SOA_Post_Lvl_Ind,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"UW"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'U') %>%
+  ggplot(aes(y=SOA_Post_Lvl_Ind, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect UW"),
+          subtitle = paste0("for unismokers")) +
+  theme_minimal()
+
+```
+:::
+
+##### SOA PLT Indicator SHAPs
+
+::: panel-tabset
+###### Smoker Class: Non-smoker, Preferred Classes: Unknown
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(SOA_Post_Lvl_Ind,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"SOA_Post_Lvl_Ind"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'NS' & NClasses == 'U') %>%
+  ggplot(aes(y=SOA_Post_Lvl_Ind, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect SOA_Post_Lvl_Ind"),
+          subtitle = paste0("for non-smokers, unknown preferred classes")) +
+  theme_minimal()
+
+
+```
+
+###### Smoker Class: Non-smoker, Preferred Classes: 2
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(SOA_Post_Lvl_Ind,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"SOA_Post_Lvl_Ind"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'NS' & NClasses == '2') %>%
+  ggplot(aes(y=SOA_Post_Lvl_Ind, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect SOA_Post_Lvl_Ind"),
+          subtitle = paste0("for non-smokers, 2 preferred classes")) +
+  theme_minimal()
+
+
+```
+
+###### Smoker Class: Non-smoker, Preferred Classes: 3
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(SOA_Post_Lvl_Ind,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"SOA_Post_Lvl_Ind"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'NS' & NClasses == '3') %>%
+  ggplot(aes(y=SOA_Post_Lvl_Ind, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect SOA_Post_Lvl_Ind"),
+          subtitle = paste0("for non-smokers, 3 preferred classes")) +
+  theme_minimal()
+
+```
+
+###### Smoker Class: Non-smoker, Preferred Classes: 4
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(SOA_Post_Lvl_Ind,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"SOA_Post_Lvl_Ind"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'NS' & NClasses == '4') %>%
+  ggplot(aes(y=SOA_Post_Lvl_Ind, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect SOA_Post_Lvl_Ind"),
+          subtitle = paste0("for non-smokers, 4 preferred classes")) +
+  theme_minimal()
+
+```
+
+###### Smoker Class: Smoker, Preferred Classes: Unknown
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(SOA_Post_Lvl_Ind,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"SOA_Post_Lvl_Ind"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'S' & NClasses == 'U') %>%
+  ggplot(aes(y=SOA_Post_Lvl_Ind, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect SOA_Post_Lvl_Ind"),
+          subtitle = paste0("for smokers, unknown preferred classes")) +
+  theme_minimal()
+
+```
+
+###### Smoker Class: Smoker, Preferred Classes: 2
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(SOA_Post_Lvl_Ind,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"SOA_Post_Lvl_Ind"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'S' & NClasses == '2') %>%
+  ggplot(aes(y=SOA_Post_Lvl_Ind, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect SOA_Post_Lvl_Ind"),
+          subtitle = paste0("for smokers, 2 preferred classes")) +
+  theme_minimal()
+
+```
+
+###### Smoker Class: Unismokers
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.notplt$X[,.(SOA_Post_Lvl_Ind,
+                    NS,
+                    Pref_Class,
+                    NClasses)],
+    shap=shp.notplt$S[,"SOA_Post_Lvl_Ind"],
+    response=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',AE_Amount],
+    offset=dat.term.noplt[IsTraining==TRUE & SOA_Post_Lvl_Ind != 'PLT',ExpDth_Amt_VBT2015]
+  )
+) %>%
+  mutate(NS=factor(NS),Pref_Class=factor(Pref_Class))  %>%
+  filter(NS == 'U') %>%
+  ggplot(aes(y=SOA_Post_Lvl_Ind, x=exp(shap),color=Pref_Class,fill=Pref_Class)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)") +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect SOA_Post_Lvl_Ind"),
+          subtitle = paste0("for unismokers")) +
+  theme_minimal()
+
+```
+:::
+
+### Next Steps in Modeling
+
+The catboost modeling is informative here for exploratory analytics. We next build an elastic net model which includes the main effects plus the interactions identified by catboost. Elastic net modeling will reveal which is truly important in a mortality model.
+
+While the work for supporting this is omitted here, it became clear that separate models should be fit for above and below 100K face amounts. A unified model had difficulty adequately fitting face amounts below 100K.
+
+### Elastic Net Models
+
+The following formula is used throughout all non-PLT, term models.
+
+```{r}
+if(bUseAllInteractions) {
+  glmnetFormula <- as.formula(
+    paste0(
+      "~ -1 + (",
+      paste(pred.cols,collapse=" + "),
+      ")^2"
+    )
+)
+} else {
+  glmnetFormula <- as.formula(
+    paste(c("~ -1",
+            pred.cols,
+            imp.int.notplt[order(-score)][Feature1 != "Noise",
+                           paste0(Feature1,":",Feature2)]),
+          collapse=" + ")
+  )
+}
+
+
+print(glmnetFormula)
+```
+
+The interactions included in the model are as follows:
+
+```{r}
+data.table(Interaction=imp.int.notplt[order(-score)][Feature1 != "Noise",
+                         paste0(Feature1,":",Feature2)]) %>%
+  flextable()
+```
+
+#### Term Model Under 100K, Excluding PLT
+
+The elastic net model is fitted. Note the use of the sparse option. This enables efficient matrix algebra when using the elastic net routines.
+
+```{r}
+### The prepELData function delivers the items
+### needed for fitting the elastic net model.
+
+### Then, fit the model
+
+dat.term.noplt.lt100k <- prepELData(
+  formula=glmnetFormula,
+  data=dat.term.noplt[
+                  Face_Amount_Band %in% c("<10K",
+    "10K - <25K",
+    "25K - <50K",
+    "50K - <100K")
+  ],
+  predictors = setdiff(pred.cols,"Smoker_Status"),
+  response = "AE_Amount",
+  weights = "ExpDth_Amt_VBT2015",
+  useSparse = T,
+  dropunused = T
+)
+
+
+set.seed(cvfit.seed)
+
+if(bUseCache & file.exists(
+  'term.model.el.noplt.lt100k.rds'
+) & !bInvalidateCaches)
+{
+  cvfit.term.noplt.lt100k <- readRDS('term.model.el.noplt.lt100k.rds')
+} else
+{
+  cvfit.term.noplt.lt100k <- fitCVGLMNet(
+    dat.term.noplt.lt100k,
+    nfolds = nFolds
+  )
+  
+  if(bUseCache)
+    saveRDS(cvfit.term.noplt.lt100k, 'term.model.el.noplt.lt100k.rds')
+}
+
+
+```
+
+##### Usual plots for Elastic Net Models
+
+When presenting elastic net models, the cross validation plot for $\lambda$ and the coefficient shrinkage plots are provided.
+
+At the minimum $\lambda$ of `r formatC(cvfit.term.noplt.lt100k$lambda.min)`, the model has `r length(coef(cvfit.term.noplt.lt100k,s="lambda.min")@i)` parameters.
+
+::: panel-tabset
+###### Lambdas
+
+```{r}
+plot(cvfit.term.noplt.lt100k)
+```
+
+###### Coefficient Penalization
+
+```{r}
+
+plot(cvfit.term.noplt.lt100k$glmnet.fit,xvar="lambda")
+```
+:::
+
+##### Factor Table
+
+Their exponentiated coefficients are as follows:
+
+```{r}
+#| classes: .vscroll .scrollable
+
+reformatCoefs(cvfit.term.noplt.lt100k, pred.cols)  %>%
+  filter(Coef != 0) %>%
+  select(Feature1Name,
+         Feature1Level,
+         Feature2Name,
+         Feature2Level,
+         Coef) %>%
+  mutate(Coef=exp(Coef)) %>%
+  flextable() %>%
+  set_formatter(
+    Coef=function(x) paste0(sprintf("%.01f", 100*x),"%")
+  ) %>%
+  theme_vanilla()
+
+
+```
+
+Note that interaction terms must be considered together. For example, UW interacts with Face Amount Band, so these should be considered in combination. The slate of UW without a second feature apply to the base level of Face Amount Band (and any other factor with which UW interacts).
+
+Since penalization is roughly equivalent to Bayesian credibility using a combination of Gaussian and Laplace priors, these factors are arguably credible. This is true even when dealing with factors with small effect sizes, such as the standalone factor for Duration 3.
+
+Plots and tables of effects are much more digestible. As it happens, all but Sex are involved in feature interactions. Those factors can be read from the table above.
+
+In the plots and tables that follow, we fix all of the other variables at their middle values when extracting final factors.
+
+We generate some supporting tables: a factor grid for attaching to the experience, and a list of interactions present in the model
+
+```{r}
+### The following code creates a grid of factors,
+### saves the grid to an Excel file, and
+### saves a listing of interactions present in the model.
+dat.term.noplt[(Face_Amount_Band %in% c("<10K",
+    "10K - <25K",
+    "25K - <50K",
+    "50K - <100K")),..pred.cols] %>%
+  mutate(Face_Amount_Band=fct_drop(Face_Amount_Band)) %>%
+  lapply(levels) %>%
+  expand.grid() -> 
+  dat.term.noplt.lt100k.grid 
+
+dat.term.noplt.lt100k.grid %>%
+  model.Matrix(
+    object=glmnetFormula,
+    data=.,
+    sparse=T
+  ) %>%
+  predict(
+    cvfit.term.noplt.lt100k,
+    newx=.,
+    s="lambda.min"
+  ) %>% 
+  as.vector() ->
+  newCoef
+
+dat.term.noplt.lt100k.grid %>%
+  add_column(
+    Factor=exp(newCoef)
+  )  %>% 
+  setDT() -> 
+  dat.term.noplt.lt100k.grid 
+
+write.xlsx(dat.term.noplt.lt100k.grid,
+           file="dat.term.noplt.lt100k.grid.xlsx")
+
+reformatCoefs(cvfit.term.noplt.lt100k, pred.cols) %>%
+  filter(Coef != 0 & !is.na(Feature2Name)) %>% 
+  select(Feature1Name,Feature2Name) %>% 
+  distinct() %>%
+  as.list() %>%
+  purrr::list_transpose() ->
+  term.no.plt.lt100k.int.list
+```
+
+##### Plots of Terms
+
+Below are plots of the 2-way interaction terms, with external factors fixed at their middle values.
+
+Some of the effects are subtle and can be confirmed by reviewing the factor table.
+
+1. Face Amount Band x UW: While factors decline with increasing face amount, the slope of the decline is qualitatively different. Moreover, the first two bands do not always obey this pattern across UW classes.
+2. Dur Group x Face Amount Band: While factors tend to decline with duration, the slope of the decline changes with face amount.
+3. SOA Post Level Ind vs UW: As foreshadowed in the review of SHAP values, there are differences in the spread of preferred factors by post level indicator, particularly in the 2-class systems.
+4. Attained Age x Face Amount Band: there are some differences at the younger attained ages and lowest band.
+5. Face Amount Band x Post Level Indicator: Factors tend to decrease, although the shapes of that decrease differ by post level indicator.
+6. Duration x UW: There is a pattern in the 2-class and 3-class residual standard non-smoker duration patterns, with a pronounced elevation through duration 20.
+7. Attained age x UW: To the extent an interaction is being detected, it is mostly at the younger attained ages.
+8. Sex x UW: The interaction appears most prominent with NS/2/2 which shares a wider spread.
+9. Duration x Post Level Indicator: ULT and NLT deviate from WLT in the earlier durations.
+10. Face Amount Band x Sex: no obvious interaction.
+11. Attained age x Duration: There are some interactions in the earliest durations for both the youngest and the middle attained ages.
+12. Duration x Sex: Nothing stands out. A review of the factor table shows subtle shifts.
+13. Attained Age x Post Level Indicator: Qualitatively, the slope seems different for ULT here.
+14. Post-Level Indicator x Sex: The interaction here appears to be with NLT and males.
+15. Attained age x Sex: There appears to be a different attained slope, most prominent amount younger males.
+
+::: panel-tabset
+```{r}
+#| message: false
+#| results: asis
+#| fig-height: 5
+
+### This code takes the interactions list,
+### for each interaction pair, plot
+### the factors, then name the list entry
+### with the interaction, and finally
+### "print" which forces it to knit.
+term.no.plt.lt100k.int.list %>%
+  map(.f=\(x) {
+    plotCVNetCoefs(dat.term.noplt.lt100k.grid,
+               sort(x),
+               "Factor",
+               pred.cols)
+  }
+  ) %>%
+  purrr::set_names(
+    map(term.no.plt.lt100k.int.list, 
+        \(x) paste0(x,collapse = " x "))
+    ) %>%
+  iwalk(~ {
+    cat('###### ',.y,'\n\n')
+    print(.x)
+    cat('\n\n')
+  } )
+
+```
+:::
+
+##### Tables of Terms
+
+Below are tables of the 2-way interaction terms, with external factors fixed at their middle values.
+
+::: panel-tabset
+```{r}
+#| message: false
+#| results: asis
+
+### Essentially the same as for plotting,
+### this code generates tables and 
+### reformats them.
+term.no.plt.lt100k.int.list %>%
+  map(.f=\(x) {
+    tableCVNetCoefs(dat.term.noplt.lt100k.grid,
+                    sort(x),
+                    "Factor",
+                    pred.cols = pred.cols) %>%
+      flextable() %>%
+      set_formatter(values = function(x) {
+                  if(is.numeric(x))
+                    sprintf( "%.1f%%", x*100 )
+                  else
+                    x
+                  }
+                  ) %>%
+      set_caption(
+        paste0("Factors for ",
+               x[1],
+               " and ",
+               x[2],
+               ", All other factors fixed at middle levels")
+        ) %>%
+      set_table_properties(opts_html=list(
+        scroll=list(
+          add_css="max-height: 500px;"
+          )
+        )
+        ) %>%
+      knitr::knit_print()
+  }
+  ) %>%
+  purrr::set_names(
+    map(term.no.plt.lt100k.int.list, 
+        \(x) paste0(x,collapse = " x "))
+    ) %>%
+  generate_tabset(
+    tabtitle="Tables of Terms",
+    tablevel = 5
+  ) %>%
+  knitr::knit_child(text=unlist(.),quiet=T) %>%
+  cat()
+
+```
+:::
+
+#### Term Model 100K+, Excluding PLT
+
+As with the under 100K model, the elastic net model is fitted. Note the use of the sparse option. This enables efficient matrix algebra when using the elastic net routines.
+
+```{r}
+
+dat.term.noplt[
+                  !(Face_Amount_Band %in% c("<10K",
+    "10K - <25K",
+    "25K - <50K",
+    "50K - <100K"))
+  ] %>%
+  mutate(Face_Amount_Band=fct_drop(Face_Amount_Band)) %>%
+  prepELData(
+    formula=glmnetFormula,
+    data=.,
+    predictors = pred.cols,
+    response = "AE_Amount",
+    weights = "ExpDth_Amt_VBT2015",
+    useSparse = T,
+    dropunused = F
+  ) -> dat.term.noplt.100kp
+
+
+set.seed(cvfit.seed)
+if(bUseCache & file.exists(
+  'term.model.el.noplt.100kp.rds'
+) & !bInvalidateCaches)
+{
+  cvfit.term.noplt.100kp <- readRDS('term.model.el.noplt.100kp.rds')
+} else
+{
+  cvfit.term.noplt.100kp <- fitCVGLMNet(
+    dat.term.noplt.100kp,
+    nfolds = nFolds
+  )
+  
+  if(bUseCache)
+    saveRDS(cvfit.term.noplt.100kp, 'term.model.el.noplt.100kp.rds')
+}
+
+```
+
+
+##### Usual plots for Elastic Net Models
+
+When presenting elastic net models, the cross validation plot for $\lambda$ and the coefficient shrinkage plots are provided.
+
+At the minimum $\lambda$ of `r formatC(cvfit.term.noplt.100kp$lambda.min)`, the model has `r length(coef(cvfit.term.noplt.100kp,s="lambda.min")@i)` parameters.
+
+::: panel-tabset
+###### Lambdas
+
+```{r}
+plot(cvfit.term.noplt.100kp)
+```
+
+###### Coefficient Penalization
+
+```{r}
+
+plot(cvfit.term.noplt.100kp$glmnet.fit,xvar="lambda")
+```
+:::
+
+##### Factor Table
+
+Their exponentiated coefficients are as follows:
+
+```{r}
+#| classes: .vscroll .scrollable
+
+reformatCoefs(cvfit.term.noplt.100kp, pred.cols)  %>%
+  filter(Coef != 0) %>%
+  select(Feature1Name,
+         Feature1Level,
+         Feature2Name,
+         Feature2Level,
+         Coef) %>%
+  mutate(Coef=exp(Coef)) %>%
+  flextable() %>%
+  set_formatter(
+    Coef=function(x) paste0(sprintf("%.01f", 100*x),"%")
+  ) %>%
+  theme_vanilla()
+
+
+```
+
+
+Plots and tables of effects are much more digestible.
+
+In the plots and tables that follow, we fix all of the other variables at their middle values when extracting final factors.
+
+We generate some supporting tables: a factor grid for attaching to the experience, and a list of interactions present in the model
+
+```{r}
+
+dat.term.noplt[!(Face_Amount_Band %in% c("<10K",
+    "10K - <25K",
+    "25K - <50K",
+    "50K - <100K")),..pred.cols] %>%
+  mutate(Face_Amount_Band=fct_drop(Face_Amount_Band)) %>%
+  lapply(levels) %>%
+  expand.grid() %>%
+  setDT() -> 
+  dat.term.noplt.100kp.grid 
+
+dat.term.noplt.100kp.grid %>%
+  model.Matrix(
+    object=glmnetFormula,
+    data=.,
+    sparse=T
+  ) %>%
+  predict(
+    cvfit.term.noplt.100kp,
+    newx=.,
+    s="lambda.min"
+  ) %>% 
+  as.vector() ->
+  newCoef
+
+dat.term.noplt.100kp.grid %>%
+  add_column(
+    Factor=exp(newCoef)
+  )  %>% 
+  setDT() -> 
+  dat.term.noplt.100kp.grid 
+
+write.xlsx(dat.term.noplt.100kp.grid,
+           file="dat.term.noplt.100kp.grid.xlsx")
+
+reformatCoefs(cvfit.term.noplt.100kp, pred.cols) %>%
+  filter(Coef != 0 & !is.na(Feature2Name)) %>% 
+  select(Feature1Name,Feature2Name) %>% 
+  distinct() %>%
+  as.list() %>%
+  purrr::list_transpose() ->
+  term.no.plt.100kp.int.list
+```
+
+##### Plots of Terms
+
+Below are plots of the 2-way interaction terms, with external factors fixed at their middle values.
+
+The interactions tend to be subtle. To that end, some larger ones are noted.
+
+1. Duration x Post-Level Indicator: Later duration unknown level term stands out.
+2. Attained Age x Post-Level Indicator: Middle attained ages for unknown level term.
+3. Attained Age x Sex: Some larger deviations for males between ages 26 and 80.
+
+::: panel-tabset
+```{r}
+#| message: false
+#| results: asis
+#| fig-height: 5
+term.no.plt.100kp.int.list %>%
+  map(.f=\(x) {
+    plotCVNetCoefs(dat.term.noplt.100kp.grid,
+               sort(x),
+               "Factor",
+               pred.cols)
+  }
+  ) %>%
+  purrr::set_names(
+    map(term.no.plt.100kp.int.list, 
+        \(x) paste0(x,collapse = " x "))
+    ) %>%
+  iwalk(~ {
+    cat('###### ',.y,'\n\n')
+    print(.x)
+    cat('\n\n')
+  } )
+
+```
+:::
+
+##### Tables of Terms
+
+Below are tables of the 2-way interaction terms, with external factors fixed at their middle values.
+
+::: panel-tabset
+```{r}
+#| message: false
+#| results: asis
+term.no.plt.100kp.int.list %>%
+  map(.f=\(x) {
+    tableCVNetCoefs(dat.term.noplt.100kp.grid,
+                    sort(x),
+                    "Factor",
+                    pred.cols = pred.cols) %>%
+      flextable() %>%
+      set_formatter(values = function(x) {
+                  if(is.numeric(x))
+                    sprintf( "%.1f%%", x*100 )
+                  else
+                    x
+                  }
+                  ) %>%
+      set_caption(
+        paste0("Factors for ",
+               x[1],
+               " and ",
+               x[2],
+               ", All other factors fixed at middle levels")
+        ) %>%
+      set_table_properties(opts_html=list(
+        scroll=list(
+          add_css="max-height: 500px;"
+          )
+        )
+        ) %>%
+      knitr::knit_print()
+  }
+  ) %>%
+  purrr::set_names(
+    map(term.no.plt.100kp.int.list, 
+        \(x) paste0(x,collapse = " x "))
+    ) %>%
+  generate_tabset(
+    tabtitle="Tables of Terms",
+    tablevel = 5
+  ) %>%
+  knitr::knit_child(text=unlist(.),quiet=T) %>%
+  cat()
+
+```
+:::
+
+#### Goodness-of-Fit
+
+Next comes checking goodness-of-fit, on both a univariate and bivariate basis. Tables are provided which show the ratio of the actual to model predicted deaths and show the associated death counts.
+
+```{r}
+#| message: false
+
+### This code attaches the grid of predicted factors
+### to the underlying data for further analysis.
+dat.term.noplt.lt100k.grid %>%
+  rbind(dat.term.noplt.100kp.grid) %>%
+  right_join(dat.term.noplt) %>%
+  mutate(ExpDth_Amt_GLMNet=ExpDth_Amt_VBT2015*Factor) %>%
+  mutate(Factor=NULL) ->
+  dat.term.noplt
+
+```
+
+##### Univariate Fit Checks
+
+::: panel-tabset
+```{r}
+#| message: false
+#| results: asis
+
+### The univariate fit checks compute actual-to-
+### model, and then formats the table
+map(pred.cols,
+    .f = \(x) {
+      x <- sym(x)
+      dat.term.noplt %>%
+        group_by(!!x) %>%
+        summarize(Death_Count=sum(Death_Count),
+                  AM=sum(Death_Claim_Amount)/sum(ExpDth_Amt_GLMNet)) %>%
+        flextable() %>%
+        set_formatter(
+          AM = function(x) {
+            if(is.numeric(x))
+              sprintf( "%.1f%%", x*100 )
+            else
+              x
+          }
+        ) %>%
+        colformat_num(j="Death_Count") %>%
+        set_header_labels(
+          Death_Count = "Death Count",
+          AM = "Actual-to-Model"
+        ) %>% 
+        knitr::knit_print()
+    }) %>%
+  purrr::set_names(pred.cols) %>%
+  generate_tabset(
+    tabtitle="Tables of Terms",
+    tablevel = 5
+  ) %>%
+  knitr::knit_child(text=unlist(.),quiet=T) %>%
+  cat()
+
+```
+:::
+
+Unidimensional goodness-of-fit is generally good, with some spots with poor fit. In some cases, it appears to be related to lack of claims, which may be a sign of overpenalization. In other cases, there are enough claims yet fit is genuinely suboptimal, such as UW U/U/U and N/1/2, level term NLT, and durations 31+, among others.
+
+##### Bivariate Fit Checks
+
+::: panel-tabset
+```{r}
+#| message: false
+#| results: asis
+
+### The same as with the univariate checks,
+### but adjust to reflect the bivariate aspects.
+### The initial code develops a list of pairs
+### of variables with repetition.
+for(i in 1:(length(pred.cols)-1)) {
+  for(j in (i+1):length(pred.cols)) {
+    if(i == 1 & j==2) {
+      pairlist <- data.table(F1=pred.cols[i],F2=pred.cols[j])
+    } else {
+      pairlist <- rbind(pairlist,
+                        data.table(F1=pred.cols[i],F2=pred.cols[j]))
+    }
+  }
+}
+
+map2(.x=pairlist$F1,
+     .y=pairlist$F2,
+    .f=\(x,y) {
+      xs <- sym(x)
+      ys <- sym(y)
+      
+      if( length(dat.term.noplt[,levels(get(x))]) >= 
+          length(dat.term.noplt[,levels(get(y))])) {
+        fttmp <- dat.term.noplt %>%
+          group_by(!!xs,!!ys) %>%
+          summarize(Deaths=sum(Death_Count),
+                    Ratio=sprintf( "%.1f%%", 
+                                   100*sum(Death_Claim_Amount)/sum(ExpDth_Amt_GLMNet) 
+                                   )
+                    ) %>%
+          pivot_wider(names_from=!!ys,
+                      values_from=c(Deaths,Ratio),
+                      names_glue = paste0(y,": {",y,"}.{.value}"),
+                      names_vary = "slowest")
+      } else {
+        fttmp <- dat.term.noplt %>%
+          group_by(!!ys,!!xs) %>%
+          summarize(Deaths=sum(Death_Count),
+                    Ratio=sprintf( "%.1f%%", 
+                                   100*sum(Death_Claim_Amount)/sum(ExpDth_Amt_GLMNet) 
+                                   )
+                    ) %>%
+          pivot_wider(names_from=!!xs,
+                      values_from=c(Deaths,Ratio),
+                      names_glue = paste0(x,": {",x,"}.{.value}"),
+                      names_vary = "slowest")
+      }
+      
+      fttmp.colkeys <- names(fttmp)[1]
+      for(i in 1:((length(names(fttmp)) -1)/2) )
+      {
+        fttmp.colkeys <- c(fttmp.colkeys,
+                           paste0("blank",i),
+                           names(fttmp)[ (2*i):(2*i+1)])
+      }
+      
+      fttmp %>%
+        flextable(col_keys = fttmp.colkeys) %>%
+        ftExtra::span_header(sep = "\\.") %>%
+        align(i = 1:2, align = 'center' ,part = "header") %>%
+        empty_blanks()%>% 
+        knitr::knit_print()
+    }) %>%
+  purrr::set_names(
+    pairlist[,paste0(F1," x ",F2)]
+    ) %>%
+  generate_tabset(
+    tabtitle="Tables of Terms",
+    tablevel = 5
+  ) %>%
+  knitr::knit_child(text=unlist(.),quiet=T) %>%
+  cat()
+```
+:::
+
+For the bivariate fit checks, the fit can be great in some cases and poor in others. This could be due to a need for higher level interactions.

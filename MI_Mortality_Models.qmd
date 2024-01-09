@@ -1,0 +1,251 @@
+---
+title: "Models for MI Group"
+format: html
+editor: visual
+toc: true
+toc-depth: 6
+toc-location: left
+code-fold: true
+number-sections: true
+embed-resources: true
+---
+
+# Setup
+
+The following sets up the environment for further analysis.
+
+```{r}
+#| output: false
+
+library(catboost)
+library(data.table)
+library(tidyverse)
+library(dtplyr)
+library(shapviz)
+library(patchwork)
+library(doParallel)
+library(glmnet)
+library(openxlsx)
+library(flextable)
+library(ftExtra)
+library(Matrix)
+library(MatrixModels)
+library(lightgbm)
+library(ggridges)
+
+source('ilec_shap_plot.R')
+source('catboost.shapviz.R') # Function which adapts catboost to shapviz
+source('glmnet_support.R') # Support functions
+source('support_fns.R')
+
+bUseCache <- TRUE # Use cached objects where available
+bInvalidateCaches <- FALSE # Force computation even if cached
+
+training.fraction <- 0.7 # Fraction of data for boosting
+
+cb.task.type <- "GPU" # Use the GPU, set to "CPU" if needed
+
+nFolds <- 10
+cvfit.seed <- 13579
+catboost.seed <- 12321
+traintest.seed <- 1337
+
+fit_params <- list(iterations = 50000,
+                   task_type=cb.task.type,
+                   loss_function = 'Poisson',
+                   verbose=250,
+                   od_pval=0.05,
+                   random_seed = catboost.seed)
+
+# Labels for relabeling face amount for nicer looking plots and tables
+fa.remap <- data.table(
+  Face_Amount_Band.Old = c(
+    "01: 0 - 9,999",
+    "02: 10,000 - 24,999",
+    "03: 25,000 - 49,999",
+    "04: 50,000 - 99,999",
+    "05: 100,000 - 249,999",
+    "06: 250,000 - 499,999",
+    "07: 500,000 - 999,999",
+    "08: 1,000,000 - 2,499,999",
+    "09: 2,500,000 - 4,999,999",
+    "10: 5,000,000 - 9,999,999",
+    "11: 10,000,000+"
+  ),
+  Face_Amount_Band.New = c(
+    "<10K",
+    "10K - <25K",
+    "25K - <50K",
+    "50K - <100K",
+    "100K - <250K",
+    "250K - <500K",
+    "500K - <1M",
+    "1M - <2.5M",
+    "2.5M - <5M",
+    "5M - <10M",
+    "10M+"
+  )
+)
+
+```
+
+```{css, echo=FALSE}
+.vscroll {
+  overflow-y: auto;
+  max-height: 500px;
+}
+
+.hscroll {
+  overflow-x: auto;
+  white-space: nowrap;
+}
+```
+
+# Data Prep
+
+The data were extracted from the ILEC dataset and restricted to experience years 2011-2017. See the associated data.prep files for more information.
+
+Variables like attained age and duration were discretized into relatively small buckets. Because of the aggregation bias in boosted decision trees when analyzing feature importance, any variable with a lot of levels will tend to "hoard" feature importance, especially if they have a lot of variability between levels of the predictor.
+
+1.  Attained age was broken into quinquennial ranges, with 0-17 and 18-25 being the exceptions.
+
+2.  Duration was broken into buckets whose width increased with duration. Thus, there are singleton groups for durations 1, 2, and 3, a doublet for 4 and 5, then quinquennial through duration 20, decennial to 30, and one large bucket thereafter.
+
+There were other minor changes.
+
+1.  Face amount band has had labels adjusted for better plotting and rendering in tables.
+
+2.  The smoker status, number of preferred classes, and preferred class was combined into a single factor where applicable.
+
+3.  The data were assigned into training/test partitions.
+
+4.  A/E ratios were computed.
+
+5.  A Noise column of standard normal random samples was added. While this was a by-product of some bug testing with catboost, it proved to be an interesting addition as a predictor for catboost. It provides a useful frame of reference when comparing variables in the feature importance plots.
+
+It became apparent during modeling that the data should be subdivided. There are three reasons for this.
+
+1.  There are differences in the underlying variable structure. Term length is populated for Term insurance plans but meaningless for the other insurance plans. Duration also has a different semantic interpretation in the presence of term length.
+
+2.  There are imbalances in the exposures or claims. For insurance plan other than Term, the subset of unismoke Perm experience has total claims orders of magnitude larger than the rest of the non-term insurance plans. For perm, there is also far less 4-class non-smoker coverage than there is for the 3-class, while term carries a meaningful amount of 4-class relative to 3-class non-smoker.
+
+3.  A sufficiently different mortality pattern exists, such that a separate model is more efficient than a unified model. This occurred in the no-post-level-term Term model, where a single model had difficulty fitting for face amounts under 100,000.
+
+Therefore, there are five models in four subdocuments.
+
+1.  Term other than PLT, PLT term, unismoke Perm, and the rest
+
+2.  Within term other than PLT, there are separate models for under and over 100K face amounts.
+
+# How To Read This Document
+
+This is laid out similarly to a traditional modeling exercise where the data are prepared, the models are built and evaluated from a statistical perspective, and results and other outputs are available at the end of the process. There is no need to read it linearly. It might useful to start at the results (Factor Tables, Plots of Terms, Tables of Terms, Goodness-of-Fit tables) before approaching other parts. The table of contents to the right expands down to those sections.
+
+Each subdivision is formatted the same way, although some details may differ:
+
+1.  Feature Discovery, where gradient boosting is applied to the data.
+
+2.  Feature Importance, where the univariate and bivariate important features are explored.
+
+3.  Elastic net modeling, where data are prepped and models calibrated. These include typical plots for the cross-validation and the coefficient shrinkage by penalization parameter.
+
+4.  Factor Table, where a table of non-trivial factors from the model are presented. These are slates of credible factors.
+
+5.  Plots of Terms, where the predicted terms are plotted together and variables not part of the plot are fixed at certain values.
+
+6.  Tables of Terms, same as the plots, but in tabular form.
+
+7.  Goodness-of-Fit Tables, where actual-to-model ratios are shown for univariate and bivariate slices of the data.
+
+# Brief Introduction to the Model Types
+
+## Gradient Boosting
+
+Gradient boosting is a technique which recursively fits simpler models on a dataset until some stopping rule is reached. Here, gradient boosted decision trees are used. First, a decision tree is fit to the data using a random subset of columns, where the tree is relatively shallow. The fitted values are applied and removed from the response variable, and another decision tree is fit on those residuals. On and on this goes, until it hits a stopping rule. In this case, the stopping rule is when the prediction error on an out-of-sample subset increases for more than a specified number of iterations.
+
+## Elastic Net GLMs
+
+Elastic net regularization allows the modeler to combine both LASSO and ridge penalties into a single model.
+
+Ordinary least squares regression requires minimizing the squared difference of the response variable and the predicted values. In symbols,
+
+$$ \underset{\beta}{\arg\min} \sum_{n}(y-X\beta)^{2} $$
+
+This is equivalent to maximum likelihood estimation, where one assumes that the response variable $y$ is normally distributed with mean $X\beta$ and variance $\sigma^{2}I_{k x k}$. The maximum is taken with respect to $\beta$, and the variance parameter is assumed to be fixed but unknown.
+
+The LASSO and ridge regression methods each add an additional penalty term on the coefficients $\beta$. The LASSO adds the sum of the absolute values of the parameters $\beta$ subject to a tunable weight, $\lambda$.
+
+$$ \underset{\beta}{\arg\min} \sum_{n}(y-X\beta)^{2}+ \lambda\sum_{k}|\beta_{k}|$$
+
+The ridge penalty adds the sum of the squares of the parameters $\beta$, subject to a tunable weight, $\alpha$.
+
+$$ \underset{\beta}{\arg\min} \sum_{n}(y-X\beta)^{2}+ \alpha\sum_{k}\beta_{k}^{2}$$
+
+In both cases, for special $\lambda$ or $\alpha$, the minimizers of these expressions correspond to the Bayesian maximum a posteriori (MAP) estimators for specific prior distributions for $\beta$. In the ridge case, the prior is the normal distribution with mean 0 and covariance $\tau^{2} I_{k x k}$ for some assumed $\tau^{2}$. For the LASSO, the prior is the double-exponential or Laplace distribution with mean 0 and parameter $\tau$. In either case, it can be shown that if $\sigma^{2}$ and $\tau$ are known, the penalizing weights have unique solutions equal to the *k* factor of Buehlmann credibility. In practice, the prior variances are unknown, and the penalizing weights must be tuned. The resulting optimal $\beta$ is also credible from a Bayesian perspective.
+
+# How To Interpret Results
+
+Not everyone may be familiar with gradient boosting or with elastic net models, so here is a quick cheat sheet on how one can make sense of the plots and tables.
+
+## Gradient Boosting
+
+Gradient boosting can produce SHAP values for each observation or row of covariates. For our purposes, the SHAP value for a given row of data and given covariate can be thought of as the marginal contribution of that covariate to the outcome for that row of data. There is additionally a baseline term analogous to an intercept in GLMs.
+
+Consider the first row of SHAP values for the Term, no PLT model. The exponentiated baseline of the model is 81.9%, compared to the A/E vs 2015VBT of 83%. For this row, face amount band and underwriting increase the predicted factor above 100%.
+
+| Variable Name    |     Variable Value | SHAP Value | Exponentiated SHAP |
+|------------------|-------------------:|-----------:|-------------------:|
+| Noise            |           0.189766 |    0.00275 |             100.3% |
+| Sex              |                  F |   -0.02366 |              97.7% |
+| Face_Amount_Band | 03 - 25,000-49,999 |   0.166174 |             118.1% |
+| SOA_Post_Lvl_Ind |                ULT |   0.004194 |             100.4% |
+| UW               |             NS/U/U |   0.091807 |             109.6% |
+| AA_Grp           |              61-65 |   -0.00502 |              99.5% |
+| Dur_Grp          |               6-10 |   -0.02374 |              97.7% |
+| Baseline         |                    |   -0.19927 |              81.9% |
+|                  |                    |            |                    |
+| Total Prediction |                    |   0.013243 |             101.3% |
+
+In isolation, these can be interesting in an underwriting context. However, to understand the broader picture, we use summary statistics.
+
+The feature importance plot display the average of absolute values of SHAP values for a given variable. Feature importance is not the same as statistical significance. It measures how much variability in the outcome is attributable to that factor. It is not analysis of variance through. If a variable participates in lots of splits, then it will get partial credit for the variability explained by other variables in the trees. This is the so-called aggregation bias.
+
+The addition of the Noise term to feature importance creates a baseline of comparison. Noise is uncorrelated Gaussian noise. Thus, if another feature has similar SHAP patterns as to noise, there may be reason to believe it is not as influential or significant. One should be cautious about using this to dismiss a variable. For example, Sex appears similar to Noise in some cases in the one-dimensional plot. Yet, it appears with another variable in a highly influential interaction.
+
+Importance of interactions is also extracted and shown. The table of scores is not informative. However, more informative are the plots of the distributions of SHAP values. If present, these can reveal shapes in the data, and if the shapes differ from subgroup to subgroup, then that is strong visual evidence for an interaction. Interesting potential interactions are pointed out in the description of the plots.
+
+## Elastic Nets
+
+Elastic net GLMs differ from GLMs via the penalization term, $\lambda$. There are two plots related to this. The first is the plot of $\lambda$ versus the cross-validation. The second is the plot of $\lambda$ versus the coefficients of the model. Lower values of $\lambda$ yield lighter penalization and more terms. Cross-validation is used to find the value which minimizes the out-of-sample error. These plots illustrate the model choices.
+
+Just like GLMs though, the table of factors can be displayed for each variable and interaction term. Absent here are confidence intervals and standard errors. These are not implemented here. However, penalization yields credible parameter estimates. Thus, the factors can be deemed credible.
+
+# Term Modeling by Amount
+
+{{< include _MI_Mortality_Models_TermNoPLT_Amt.qmd >}}
+
+{{< include _MI_Mortality_Models_TermPLT_Amt.qmd >}}
+
+# Perm Modeling by Amount
+
+{{< include _MI_Mortality_Models_PermUnk_Amt.qmd >}}
+
+{{< include _MI_Mortality_Models_PermSmokerKnown_Amt.qmd >}}
+
+# Running the Workbook
+
+To run this workbook, you will need the supporting R functions and a compatible dataset.
+
+The dataset is extracted from the ILEC data. Provided variable names and their content are identical and that the data objects are stored in RDS files of the appropriate names, then the workbook should run as is.
+
+Computation is not onerous. A GPU was used for gradient boosting in anticipation of needing substantial computing power. Early attempts greatly benefited from it. However, as modeling progressed, the gradient boosting models became simple enough that it could run reasonably well on CPU. For elastic net, the use of sparse matrices ensures that memory should not be an issue except in the most basic environment. CPU usage is a different matter. By default, we use 10 cores for cross-validation. If 10 cores are available, the elastic net models typically require only a few minutes to run. If you do not have 10 cores, adjust expectations accordingly.
+
+The workbook, when executed, will carry out the following:
+
+1.  Load the data and apply transformations.
+
+2.  If not already made, fit Catboost models, and exhibit results.
+
+3.  If not already made, fit elastic net models, and exhibit results.
+
+4.  Generate factor tables for attaching to experience data.

@@ -1,0 +1,772 @@
+## Perm Model, Unknown Smoker
+
+```{r}
+#| output: false
+
+dat.perm.unk <- readRDS("dat.perm.rds")
+dat.perm.unk <- dat.perm.unk[Policies_Exposed > 0]
+dat.perm.unk <- dat.perm.unk[UW == "U/U/U" &
+                               Insurance_Plan == "Perm"]
+
+bUseAllInteractions <- FALSE
+
+AA.brks <- c(-1,17,
+             seq(25,120,5))
+AA.lbls <- paste0(
+  AA.brks[1:(length(AA.brks)-1)]+1,
+  "-",
+  AA.brks[2:length(AA.brks)]
+)
+
+Dur.brks <- c(0,1,2,3,5,10,15,20,30,120)
+Dur.lbls <- paste0(
+  Dur.brks[1:(length(Dur.brks)-1)]+1,
+  "-",
+  Dur.brks[2:length(Dur.brks)]
+)
+
+dat.perm.unk[,`:=`(
+  AA_Grp=cut(Attained_Age,
+              breaks=AA.brks,
+              labels=AA.lbls),
+  Dur_Grp=cut(Duration,
+               breaks=Dur.brks,
+               labels=Dur.lbls)
+)]
+
+
+
+pred.cols <- names(dat.perm.unk)[c(1,5,16:17)]
+
+factor.cols <- pred.cols
+
+dat.perm.unk[,
+      (factor.cols):=lapply(.SD,factor),
+      .SDcols=factor.cols]
+
+set.seed(traintest.seed)
+dat.perm.unk %>%
+  mutate(
+    IsTraining = (runif(nrow(.)) < training.fraction),
+    Noise = rnorm(nrow(.)),
+    .before = 1
+  ) %>% 
+  mutate(Face_Amount_Band=fct_relabel(
+    Face_Amount_Band,
+    #function(.) sub(":"," -",.,fixed=T)
+    function(.) fa.remap[Face_Amount_Band.Old==.,Face_Amount_Band.New]
+    ),
+    AE_Count=Death_Count/ExpDth_Cnt_VBT2015,
+    AE_Amount=Death_Claim_Amount/ExpDth_Amt_VBT2015
+  ) -> 
+  dat.perm.unk
+
+gbm.pred.cols <- c("Noise",pred.cols)
+```
+
+Here is a data preview.
+
+```{r}
+
+dat.perm.unk %>%
+  head(10) %>%
+  flextable()
+
+```
+
+### Feature Discovery with Catboost
+
+As in the predictive analytics framework, gradient boosted machines as implemented with Catboost are used for exploratory data analysis. The framework uses LightGBM, while Catboost is used here. LightGBM does not currently support GPUs under Windows Subsystem for Linux 2, which is why Catboost is used here.
+
+
+```{r}
+
+dat.perm.unk %>% 
+  filter(IsTraining == TRUE) %>% 
+  select(all_of(gbm.pred.cols)) %>% 
+  mutate(Sex = as.numeric(Sex)) %>%
+  catboost.load_pool(
+    data=.,
+    label = dat.perm.unk[IsTraining==TRUE,AE_Amount],
+    weight = dat.perm.unk[IsTraining==TRUE,ExpDth_Amt_VBT2015]) ->
+  train_pool_perm_unk
+
+dat.perm.unk %>% 
+  filter(IsTraining == FALSE) %>% 
+  select(all_of(gbm.pred.cols)) %>% 
+  mutate(Sex = as.numeric(Sex)) %>%
+  catboost.load_pool(
+    data=.,
+    label = dat.perm.unk[IsTraining==FALSE,AE_Amount],
+    weight = dat.perm.unk[IsTraining==FALSE,ExpDth_Amt_VBT2015]) ->
+  test_pool_perm_unk
+
+if(bUseCache & file.exists(
+  'dat.term.mod.perm.unk.cbm'
+) & !bInvalidateCaches)
+{
+  cb.model.perm.unk <- catboost.load_model(model_path = 'dat.term.mod.perm.unk.cbm')
+} else {
+  cb.model.perm.unk <- catboost.train(learn_pool=train_pool_perm_unk,
+                             test_pool = test_pool_perm_unk,
+                             params=fit_params)
+  
+  catboost.save_model(cb.model.perm.unk,
+                      model_path = 'dat.term.mod.perm.unk.cbm')
+}
+```
+
+### Feature Importance
+
+Next is to check for the variables with most variability. Duration, face amount, and attained age top the importance chart.
+
+```{r}
+
+shp.perm.unk <- shapviz(
+  cb.model.perm.unk,
+  X=as.data.frame(dat.perm.unk[IsTraining==TRUE,..gbm.pred.cols]),
+  X_pred=train_pool_perm_unk
+)
+setDT(shp.perm.unk$X)
+
+sv_importance(shp.perm.unk) + theme_minimal()
+
+```
+
+### Feature Interactions
+
+```{r}
+imp.int.perm.unk <- catboost.get_feature_importance(
+  cb.model.perm.unk,
+  type="Interaction"
+)
+
+
+
+mod.ft.map.perm.unk <- data.table(
+  FeatureNames=names(dat.perm.unk[IsTraining==TRUE,..gbm.pred.cols])
+)
+
+mod.ft.map.perm.unk[,ID:=1:nrow(.SD)-1]
+
+imp.int.perm.unk %>%
+  merge(mod.ft.map.perm.unk,
+        by.x="feature1_index",
+        by.y="ID") %>%
+  merge(mod.ft.map.perm.unk,
+        by.x="feature2_index",
+        by.y="ID") %>%
+  setnames(
+    old=c("FeatureNames.x","FeatureNames.y"),
+    new=c("Feature1","Feature2")
+  ) %>% 
+  mutate(feature1_index=NULL,feature2_index=NULL) %>%
+  as.data.table() %>%
+  setcolorder(c("Feature1","Feature2","score")) -> 
+  imp.int.perm.unk
+
+imp.int.perm.unk[order(-score)] %>%
+  filter(Feature1 != "Noise") %>%
+  flextable() %>%
+  colformat_double(j="score",digits=2)
+```
+
+### Feature Interaction Plots
+
+Each of the interactions are discussed below with plots using SHAP values from both sides of the interaction.
+
+#### Attained Age Group
+
+##### Face Amount Band SHAPs
+
+Several things are apparent in the following ridge plot:
+
+1. The two lowest face amount bands, <10K and 10k - <25K, tend to be strongly separated rightward from the others.
+2. Starting at about attained age 61 or so, the difference between those two low bands and the others narrows.
+3. This suggests the potential that the slope of the 2015 VBT above attained age 65 for unknown perm business is generally off.
+
+```{r}
+#| warning: false
+#| message: false
+data.table(
+  cbind(
+    shp.perm.unk$X[,.(Face_Amount_Band,
+                      AA_Grp)],
+    shap=shp.perm.unk$S[,"Face_Amount_Band"]
+  )
+) %>%
+  ggplot(aes(y=AA_Grp, x=exp(shap),color=Face_Amount_Band,fill=Face_Amount_Band)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)",
+                     limits = c(NA,NA)) +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect Face_Amount_Band"),
+          subtitle = paste0("by attained age")) +
+  theme_minimal()
+```
+
+##### Attained Age SHAPs
+
+The interaction within attained age group SHAPs is harder to trace out. Higher attained ages 61+ exhibit different locations of the SHAP distribution for lower face amounts than higher. This is borne out in both views below.
+
+::: panel-tabset
+###### Relative to attained age groups
+```{r}
+#| warning: false
+#| message: false
+data.table(
+  cbind(
+    shp.perm.unk$X[,.(Face_Amount_Band,
+                      AA_Grp)],
+    shap=shp.perm.unk$S[,"AA_Grp"]
+  )
+) %>%
+  ggplot(aes(y=AA_Grp, x=exp(shap),color=Face_Amount_Band,fill=Face_Amount_Band)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)",
+                     limits = c(NA,NA)) +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect AA_Grp"),
+          subtitle = paste0("by attained age")) +
+  theme_minimal() + 
+  facet_wrap(vars(Face_Amount_Band))
+```
+
+###### Relative to face amount band
+```{r}
+#| warning: false
+#| message: false
+data.table(
+  cbind(
+    shp.perm.unk$X[,.(Face_Amount_Band,
+                      AA_Grp)],
+    shap=shp.perm.unk$S[,"AA_Grp"]
+  )
+) %>%
+  ggplot(aes(y=Face_Amount_Band, x=exp(shap),color=AA_Grp,fill=AA_Grp)) +
+  stat_density_ridges(alpha=0.9/4,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)",
+                     limits = c(NA,NA)) +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect AA_Grp"),
+          subtitle = paste0("by face amount band")) +
+  theme_minimal() +
+  facet_wrap(vars(AA_Grp))
+```
+:::
+
+#### Duration Group
+
+##### Face Amount Band SHAPs
+
+There is some suggestion of differing slope by duration across face amount bands.
+
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.perm.unk$X[,.(Face_Amount_Band,
+                      Dur_Grp)],
+    shap=shp.perm.unk$S[,"Face_Amount_Band"]
+  )
+) %>%
+  ggplot(aes(y=Dur_Grp, x=exp(shap),color=Face_Amount_Band,fill=Face_Amount_Band)) +
+  stat_density_ridges(alpha=0.9,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)",
+                     limits = c(NA,NA)) +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect Face_Amount_Band"),
+          subtitle = paste0("by face amount and duration")) +
+  theme_minimal() +
+  facet_wrap(vars(Face_Amount_Band))
+```
+
+##### Duration Group SHAPs
+
+There are at least two sources of interaction here:
+
+1. Early duration and low face amount
+2. Multimodal distributions, with a diversity in the number and location of modes
+
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.perm.unk$X[,.(Face_Amount_Band,
+                      Dur_Grp)],
+    shap=shp.perm.unk$S[,"Dur_Grp"]
+  )
+) %>%
+  ggplot(aes(y=Dur_Grp, x=exp(shap),color=Face_Amount_Band,fill=Face_Amount_Band)) +
+  stat_density_ridges(alpha=0.9,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)",
+                     limits = c(NA,NA)) +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect Dur_Grp"),
+          subtitle = paste0("by face amount and duration")) +
+  theme_minimal() +
+  facet_wrap(vars(Face_Amount_Band))
+```
+
+#### Attained Age vs Duration
+
+##### Attained Age SHAPs
+
+There appears to be an interaction for durations 16+, attained ages 61+, where the attained age SHAP is lower than for others.
+
+```{r}
+#| message: false
+#| warning: false
+
+data.table(
+  cbind(
+    shp.perm.unk$X[,.(AA_Grp,
+                    Dur_Grp)],
+    shap=shp.perm.unk$S[,"AA_Grp"]
+  )
+) %>%
+  ggplot(aes(y=AA_Grp, x=exp(shap),color=Dur_Grp,fill=Dur_Grp)) +
+  stat_density_ridges(alpha=0.9,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)",
+                     limits = c(NA,NA)) +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect AA_Grp")) +
+  theme_minimal() +
+  facet_wrap(vars(Dur_Grp))
+
+```
+
+##### Duration SHAPs
+
+The opposite is true within the duration SHAPs. Here, there is an interaction for early durations <16 for attained ages 61+.
+
+```{r}
+#| message: false
+#| warning: false
+data.table(
+  cbind(
+    shp.perm.unk$X[,.(AA_Grp,
+                      Dur_Grp)],
+    shap=shp.perm.unk$S[,"Dur_Grp"]
+  )
+) %>%
+  ggplot(aes(y=AA_Grp, x=exp(shap),color=Dur_Grp,fill=Dur_Grp)) +
+  stat_density_ridges(alpha=0.9,scale=1,quantile_lines = T,quantiles = 0.5) + 
+  scale_x_continuous(labels = scales::percent,
+                     name="Exponentiated SHAP Value (% relative to Offset)",
+                     limits = c(NA,NA)) +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  ggtitle(label=paste0("Ridge plot of SHAP values for Effect Dur_Grp")) +
+  theme_minimal() +
+  facet_wrap(vars(Dur_Grp))
+```
+
+Overall, this suggests that the current dataset and 2015 VBT may not have slopes in sync at older ages.
+
+### Next Steps in Modeling
+
+The catboost modeling is informative here for exploratory analytics. We next build an elastic net model which includes the main effects plus the top eight interactions from the catboost analysis. This cutoff is chosen arbitrarily. The top three are stronger than the others, while the next five seem to cluster in the middle. These interactions may turn out to be unneeded. Elastic net modeling will reveal which is truly important in a mortality model.
+
+While the work for supporting this is omitted here, it became clear that separate models should be fit for above and below 100K face amounts. A unified model had difficulty adequately fitting face amounts below 100K.
+
+### Elastic Net Models
+
+The following formula is used below:
+
+```{r}
+
+if(bUseAllInteractions) {
+  glmnetFormula <- as.formula(
+    paste0(
+      "~ -1 + (",
+      paste(pred.cols,collapse=" + "),
+      ")^2"
+    )
+)
+} else {
+  glmnetFormula <- as.formula(
+    paste(c("~ -1",
+            pred.cols,
+            imp.int.perm.unk[order(-score)][Feature1 != "Noise",
+                           paste0(Feature1,":",Feature2)]),
+          collapse=" + ")
+  )
+}
+
+
+print(glmnetFormula)
+
+```
+
+The interactions included in the model are as follows:
+
+```{r}
+
+data.table(Interaction=imp.int.perm.unk[order(-score)][Feature1 != "Noise",
+                         paste0(Feature1,":",Feature2)]) %>% 
+  flextable()
+```
+
+#### Model Fit
+
+```{r}
+
+dat.perm.unk.el <- prepELData(
+  formula=glmnetFormula,
+  data=dat.perm.unk,
+  predictors = pred.cols,
+  response = "AE_Amount",
+  weights = "ExpDth_Amt_VBT2015",
+  useSparse = T
+)
+
+
+set.seed(cvfit.seed)
+if(bUseCache & file.exists(
+  'perm.model.unk.el.rds'
+) & !bInvalidateCaches)
+{
+  cvfit.perm.unk <- readRDS('perm.model.unk.el.rds')
+} else
+{
+  cvfit.perm.unk <- fitCVGLMNet(
+    dat.perm.unk.el,
+    nfolds = nFolds
+  )
+  
+  if(bUseCache)
+    saveRDS(cvfit.perm.unk, 'perm.model.unk.el.rds')
+}
+
+
+```
+
+##### Usual plots for Elastic Net Models
+
+When presenting elastic net models, the cross validation plot for $\lambda$ and the coefficient shrinkage plots are provided.
+
+At the minimum $\lambda$ of `r formatC(cvfit.perm.unk$lambda.min)`, the model has `r length(coef(cvfit.perm.unk,s="lambda.min")@i)` parameters.
+
+::: panel-tabset
+##### Lambdas
+
+```{r}
+
+plot(cvfit.perm.unk)
+```
+
+##### Coefficient Penalization
+
+```{r}
+
+plot(cvfit.perm.unk$glmnet.fit,xvar="lambda")
+```
+:::
+
+##### Factor Table
+
+The exponentiated coefficients are as follows:
+
+```{r}
+#| classes: .vscroll .scrollable
+reformatCoefs(cvfit.perm.unk, pred.cols)  %>%
+  filter(Coef != 0) %>%
+  select(Feature1Name,
+         Feature1Level,
+         Feature2Name,
+         Feature2Level,
+         Coef) %>%
+  mutate(Coef=exp(Coef)) %>%
+  flextable() %>%
+  set_formatter(
+    Coef=function(x) paste0(sprintf("%.01f", 100*x),"%")
+  ) %>%
+  theme_vanilla()
+
+
+```
+
+Note that interaction terms must be considered together, as noted in prior sections. Since penalization is roughly equivalent to Bayesian credibility, these factors are arguably credible. This is true even when dealing with factors with small effect sizes, such as the standalone factor for Duration 3.
+
+Plots of effects are much more digestible. 
+
+In the plots and tables that follow, we fix all of the other variables at their middle values when extracting final factors.
+
+We generate some supporting tables: a factor grid for attaching to the experience, and a list of interactions present in the model
+
+```{r}
+
+dat.perm.unk[,..pred.cols] %>%
+  lapply(levels) %>%
+  expand.grid() %>%
+  setDT() -> 
+  dat.perm.unk.grid 
+
+dat.perm.unk.grid %>%
+  model.Matrix(
+    object=glmnetFormula,
+    data=.,
+    sparse=T
+  ) %>%
+  predict(
+    cvfit.perm.unk,
+    newx=.,
+    s="lambda.min"
+  ) %>% 
+  as.vector() ->
+  newCoef
+
+dat.perm.unk.grid %>%
+  add_column(
+    Factor=exp(newCoef)
+  )  %>% 
+  setDT() -> 
+  dat.perm.unk.grid 
+
+write.xlsx(dat.perm.unk.grid,
+           file="dat.perm.unk.grid.xlsx")
+
+reformatCoefs(cvfit.perm.unk, pred.cols) %>%
+  filter(Coef != 0 & !is.na(Feature2Name)) %>% 
+  select(Feature1Name,Feature2Name) %>% 
+  distinct() %>%
+  as.list() %>%
+  purrr::list_transpose() ->
+  perm.unk.int.list
+```
+
+##### Plots of Terms
+
+Below are plots of the 2-way interaction terms, with external factors fixed at their middle values.
+
+1. Attained Age x Face Amount Band: A "ridge" between attained ages 35 and 70 is apparent at the lowest face amounts. The ridge vanishes with increasing face amount, then reappears at higher face amounts.
+2. Duration x Face Amount Band: A similar though smaller "ridge" is observed for durations 6-30.
+3. Attained Age x Duration: Mortality by attained age steepens with increasing age from 81-100, with declining slope by duration at later durations.
+4. Face Amount Band x Sex: This interaction may be misleading. There is very little data at such large face amounts, especially for females. This can be observed in the Goodness-of-Fit section.
+5. Attained Age x Sex: The interaction here appears to be with males aged 46-70, with increased mortality.
+
+::: panel-tabset
+```{r}
+#| message: false
+#| results: asis
+#| fig-height: 5
+perm.unk.int.list %>%
+  map(.f=\(x) {
+    plotCVNetCoefs(dat.perm.unk.grid,
+               sort(x),
+               "Factor",
+               pred.cols)
+  }
+  ) %>%
+  purrr::set_names(
+    map(perm.unk.int.list, 
+        \(x) paste0(x,collapse = " x "))
+    ) %>%
+  iwalk(~ {
+    cat('###### ',.y,'\n\n')
+    print(.x)
+    cat('\n\n')
+  } )
+
+```
+:::
+
+##### Tables of Terms
+
+Below are tables of the 2-way interaction terms, with external factors fixed at their middle values.
+
+::: panel-tabset
+```{r}
+#| message: false
+#| results: asis
+perm.unk.int.list %>%
+  map(.f=\(x) {
+    tableCVNetCoefs(dat.perm.unk.grid,
+                    sort(x),
+                    "Factor",
+                    pred.cols = pred.cols) %>%
+      flextable() %>%
+      set_formatter(values = function(x) {
+                  if(is.numeric(x))
+                    sprintf( "%.1f%%", x*100 )
+                  else
+                    x
+                  }
+                  ) %>%
+      set_caption(
+        paste0("Factors for ",
+               x[1],
+               " and ",
+               x[2],
+               ", All other factors fixed at middle levels")
+        ) %>%
+      set_table_properties(opts_html=list(
+        scroll=list(
+          add_css="max-height: 500px;"
+          )
+        )
+        ) %>%
+      knitr::knit_print()
+  }
+  ) %>%
+  purrr::set_names(
+    map(perm.unk.int.list, 
+        \(x) paste0(x,collapse = " x "))
+    ) %>%
+  generate_tabset(
+    tabtitle="Tables of Terms",
+    tablevel = 5
+  ) %>%
+  knitr::knit_child(text=unlist(.),quiet=T) %>%
+  cat()
+
+```
+:::
+
+#### Goodness-of-Fit
+
+Next comes checking goodness-of-fit, on both a univariate and bivariate basis. Tables are provided which show the ratio of the actual to model predicted deaths and show the associated death counts.
+
+```{r}
+#| message: false
+dat.perm.unk.grid%>%
+  right_join(dat.perm.unk) %>%
+  mutate(ExpDth_Amt_GLMNet=ExpDth_Amt_VBT2015*Factor) %>%
+  mutate(Factor=NULL) ->
+  dat.perm.unk
+
+```
+
+##### Univariate Fit Checks
+
+::: panel-tabset
+```{r}
+#| message: false
+#| results: asis
+map(pred.cols,
+    .f = \(x) {
+      x <- sym(x)
+      dat.perm.unk %>%
+        group_by(!!x) %>%
+        summarize(Death_Count=sum(Death_Count),
+                  AM=sum(Death_Claim_Amount)/sum(ExpDth_Amt_GLMNet)) %>%
+        flextable() %>%
+        set_formatter(
+          AM = function(x) {
+            if(is.numeric(x))
+              sprintf( "%.1f%%", x*100 )
+            else
+              x
+          }
+        ) %>%
+        colformat_num(j="Death_Count") %>%
+        set_header_labels(
+          Death_Count = "Death Count",
+          AM = "Actual-to-Model"
+        ) %>% 
+        knitr::knit_print()
+    }) %>%
+  purrr::set_names(pred.cols) %>%
+  generate_tabset(
+    tabtitle="Tables of Terms",
+    tablevel = 5
+  ) %>%
+  knitr::knit_child(text=unlist(.),quiet=T) %>%
+  cat()
+
+```
+:::
+
+
+##### Bivariate Fit Checks
+
+::: panel-tabset
+```{r}
+#| message: false
+#| results: asis
+for(i in 1:(length(pred.cols)-1)) {
+  for(j in (i+1):length(pred.cols)) {
+    if(i == 1 & j==2) {
+      pairlist <- data.table(F1=pred.cols[i],F2=pred.cols[j])
+    } else {
+      pairlist <- rbind(pairlist,
+                        data.table(F1=pred.cols[i],F2=pred.cols[j]))
+    }
+  }
+}
+
+map2(.x=pairlist$F1,
+     .y=pairlist$F2,
+    .f=\(x,y) {
+      xs <- sym(x)
+      ys <- sym(y)
+      
+      if( length(dat.perm.unk[,levels(get(x))]) >= 
+          length(dat.perm.unk[,levels(get(y))])) {
+        fttmp <- dat.perm.unk %>%
+          group_by(!!xs,!!ys) %>%
+          summarize(Deaths=sum(Death_Count),
+                    Ratio=sprintf( "%.1f%%", 
+                                   100*sum(Death_Claim_Amount)/sum(ExpDth_Amt_GLMNet) 
+                                   )
+                    ) %>%
+          pivot_wider(names_from=!!ys,
+                      values_from=c(Deaths,Ratio),
+                      names_glue = paste0(y,": {",y,"}.{.value}"),
+                      names_vary = "slowest")
+      } else {
+        fttmp <- dat.perm.unk %>%
+          group_by(!!ys,!!xs) %>%
+          summarize(Deaths=sum(Death_Count),
+                    Ratio=sprintf( "%.1f%%", 
+                                   100*sum(Death_Claim_Amount)/sum(ExpDth_Amt_GLMNet) 
+                                   )
+                    ) %>%
+          pivot_wider(names_from=!!xs,
+                      values_from=c(Deaths,Ratio),
+                      names_glue = paste0(x,": {",x,"}.{.value}"),
+                      names_vary = "slowest")
+      }
+      
+      fttmp.colkeys <- names(fttmp)[1]
+      for(i in 1:((length(names(fttmp)) -1)/2) )
+      {
+        fttmp.colkeys <- c(fttmp.colkeys,
+                           paste0("blank",i),
+                           names(fttmp)[ (2*i):(2*i+1)])
+      }
+      
+      fttmp %>%
+        flextable(col_keys = fttmp.colkeys) %>%
+        ftExtra::span_header(sep = "\\.") %>%
+        align(i = 1:2, align = 'center' ,part = "header") %>%
+        empty_blanks()%>% 
+        knitr::knit_print()
+    }) %>%
+  purrr::set_names(
+    pairlist[,paste0(F1," x ",F2)]
+    ) %>%
+  generate_tabset(
+    tabtitle="Tables of Terms",
+    tablevel = 5
+  ) %>%
+  knitr::knit_child(text=unlist(.),quiet=T) %>%
+  cat()
+```
+:::
+
