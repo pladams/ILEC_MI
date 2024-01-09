@@ -1,3 +1,6 @@
+# From the shapviz vignette
+# https://cran.r-project.org/web//packages/shapviz/vignettes/basic_use.html
+
 shapviz.catboost.Model <- function(object, X_pred, X = X_pred, collapse = NULL, ...) {
   if (!requireNamespace("catboost", quietly = TRUE)) {
     stop("Package 'catboost' not installed")
